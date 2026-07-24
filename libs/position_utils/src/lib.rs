@@ -320,9 +320,6 @@ pub fn is_liquidatable(
         collateral_token_price,
         TOKEN_PRECISION,
     );
-    // net_collateral excludes PnL — used for the min_collateral_factor adequacy check.
-    // PnL should not mask a collateral shortfall: a profitable unrealised gain does
-    // not mean the deposited collateral is sufficient to absorb liquidation costs.
     let net_collateral = collateral_usd - fees_usd;
     let remaining = net_collateral + pnl_usd;
 
@@ -342,8 +339,9 @@ pub fn is_liquidatable(
         min_collateral_factor,
         FLOAT_PRECISION,
     );
-    // Use net_collateral (no PnL) so unrealised gains cannot hide a collateral shortfall.
-    net_collateral < min_required
+    // Use remaining (net_collateral + PnL) so insolvent positions are caught even when
+    // nominal collateral is above the min_collateral_factor threshold.
+    remaining < min_required
 }
 
 // ─── Position key ─────────────────────────────────────────────────────────────
@@ -1176,18 +1174,15 @@ mod tests {
         );
     }
 
-    /// Bug #2 — PnL must not mask a collateral shortfall in the min_collateral_factor check.
+    /// Positive PnL that lifts remaining above min_required → NOT liquidatable.
     ///
     /// Setup: size=$10 000, collateral=$500 gross, pending borrowing fees≈$420
     ///   → net_collateral = $500 - $420 = $80
     ///   → min_collateral_factor = 1% → min_required = $100
-    ///   → net_collateral ($80) < min_required ($100) → LIQUIDATABLE
-    ///
-    /// The position also has +$100 unrealised PnL. Before this fix, the old code
-    /// computed `remaining = $80 + $100 = $180 ≥ $100` and returned false (not
-    /// liquidatable). The fixed code must return true.
+    ///   → net_collateral ($80) < min_required ($100)
+    ///   → BUT +$200 unrealised PnL → remaining = $280 ≥ $100 → NOT LIQUIDATABLE
     #[test]
-    fn pnl_does_not_mask_collateral_shortfall_below_min_factor() {
+    fn positive_pnl_saves_position_above_min_factor() {
         let w = setup();
         let ds_c = DsClient::new(&w.env, &w.ds);
         let market = make_market(&w);
@@ -1208,13 +1203,6 @@ mod tests {
         let collateral_tokens = ONE_TOKEN / 4;
 
         // Set a large cumulative borrowing factor so fees ≈ $420
-        // We need: borrowing_fee_amount × collateral_price / TOKEN_PRECISION ≈ $420 * FP
-        // borrowing_fee_amount = delta × size_in_tokens / FP
-        // size_in_tokens = size_usd / entry_price × TOKEN_PRECISION = 10_000*FP / (2_000*FP) × TOKEN_PRECISION = 5 tokens
-        // We want fee_amount_tokens such that fee_amount_tokens × 2_000*FP / TOKEN_PRECISION ≈ 420*FP
-        // fee_amount_tokens ≈ 420*FP × TOKEN_PRECISION / (2_000*FP) = 210 * ONE_TOKEN / 100 = 2_100_000
-        // delta × 5 tokens / FP = 2_100_000 → delta = 2_100_000 × FP / (5 × TOKEN_PRECISION)
-        //                                            = 2_100_000 × FP / 50_000_000 = 42 * FP / 1_000
         let size_in_tokens = 5 * ONE_TOKEN; // 5 tokens
         let delta = 42 * FP / 1_000;        // cumulative borrowing factor delta
         ds_c.set_u128(
@@ -1227,17 +1215,60 @@ mod tests {
         position.size_in_tokens = size_in_tokens;
         position.borrowing_factor = 0; // opened at cum=0
 
-        // Price advances 2% → unrealised PnL ≈ +$200 (should NOT save the position)
-        let current_price = 2_040 * FP; // slight profit
+        // Price advances 2% → unrealised PnL ≈ +$200
+        // remaining = $80 + $200 = $280 ≥ $100 → solvent
+        let current_price = 2_040 * FP;
         let price_props = PriceProps {
             min: current_price,
             max: current_price,
         };
 
-        // Fixed: net_collateral < min_required → must be liquidatable
+        assert!(
+            !is_liquidatable(&w.env, &w.ds, &position, &market, collateral_price, &price_props),
+            "position with remaining ($280) above min_required ($100) must NOT be liquidatable"
+        );
+    }
+
+    /// Issue #406 — insolvent position hidden by high nominal collateral.
+    ///
+    /// Setup: size=$10 000 long, collateral=$3 000 gross, no fees
+    ///   → net_collateral = $3 000
+    ///   → min_collateral_factor = 1% → min_required = $100
+    ///   → 50% price crash → PnL = -$5 000
+    ///   → remaining = $3 000 - $5 000 = -$2 000 → INSOLVENT → LIQUIDATABLE
+    #[test]
+    fn deeply_underwater_position_is_liquidatable() {
+        let w = setup();
+        let ds_c = DsClient::new(&w.env, &w.ds);
+        let market = make_market(&w);
+
+        // 1% min collateral factor
+        let min_factor = FP / 100;
+        ds_c.set_u128(
+            &w.admin,
+            &gmx_keys::min_collateral_factor_key(&w.env, &w.market_tk),
+            &(min_factor as u128),
+        );
+
+        let collateral_price = 2_000 * FP;
+        let size_usd = 10_000 * FP;
+        // 1.5 tokens × $2 000 = $3 000 gross collateral
+        let collateral_tokens = ONE_TOKEN * 3 / 2;
+        let size_in_tokens = 5 * ONE_TOKEN;
+
+        let mut position = make_position(&w, size_usd, collateral_tokens, collateral_price);
+        position.size_in_tokens = size_in_tokens;
+
+        // 50% price crash → PnL = -0.5 × 10_000 = -$5 000
+        let crash_price = 1_000 * FP;
+        let price_props = PriceProps {
+            min: crash_price,
+            max: crash_price,
+        };
+
         assert!(
             is_liquidatable(&w.env, &w.ds, &position, &market, collateral_price, &price_props),
-            "position with net_collateral below min_collateral_factor must be liquidatable even with positive PnL"
+            "position with remaining = -$2 000 must be liquidatable"
         );
     }
 
